@@ -1,0 +1,3 @@
+dependencies:
+  - name: espressif/i2c_master
+    version: "*"
