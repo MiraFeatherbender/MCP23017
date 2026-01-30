@@ -1,4 +1,4 @@
-# MCP23017 Component (scaffold)
+# MCP23017 Component
 
 This scaffold contains the MCP23017 component sources and an example plugin app.
 
