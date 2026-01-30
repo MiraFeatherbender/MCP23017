@@ -1,7 +1,0 @@
-build/
-sdkconfig
-sdkconfig.*
-*.log
-.vscode/
-*.pyc
-/.idea/

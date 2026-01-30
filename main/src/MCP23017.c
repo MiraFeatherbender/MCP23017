@@ -230,28 +230,46 @@ esp_err_t mcp23017_write_gpio16(void *handle, int dev_idx, uint16_t value)
     return mcp23017_reg_write8((mcp23017_handle_t)handle, dev_idx, MCP_REG_OLATB, b);
 }
 
-esp_err_t mcp23017_auto_setup(mcp23017_attached_devices_t *out_devices, bool apply_defaults)
+esp_err_t mcp23017_auto_setup(mcp23017_attached_devices_t *out_devices, bool apply_defaults, const i2c_master_bus_config_t *user_bus_cfg)
 {
     if (!out_devices) return ESP_ERR_INVALID_ARG;
     memset(out_devices, 0, sizeof(*out_devices));
 
-    const int AUTO_SETUP_RETRIES = 50;
+    const int AUTO_SETUP_RETRIES = 10;
     const int AUTO_SETUP_DELAY_MS = 200;
 
-    // Try to obtain an existing I2C master bus handle (prefer I2C_NUM_0 then I2C_NUM_1)
     i2c_master_bus_handle_t bus = NULL;
+    bool created_bus = false;
     int attempt = 0;
-    while (attempt < AUTO_SETUP_RETRIES) {
-        if (i2c_master_get_bus_handle(I2C_NUM_0, &bus) == ESP_OK) break;
-        if (i2c_master_get_bus_handle(I2C_NUM_1, &bus) == ESP_OK) break;
-        attempt++;
-        if (attempt >= AUTO_SETUP_RETRIES) break;
-        ESP_LOGI(TAG, "mcp23017: waiting for I2C bus (attempt %d/%d)", attempt+1, AUTO_SETUP_RETRIES);
-        vTaskDelay(pdMS_TO_TICKS(AUTO_SETUP_DELAY_MS));
-    }
-    if (!bus) {
-        ESP_LOGW(TAG, "No existing I2C master bus found after %d attempt(s)", AUTO_SETUP_RETRIES);
-        return ESP_ERR_NOT_FOUND;
+
+    // If the caller provided a bus config, create the bus directly and skip auto-detection.
+    if (user_bus_cfg) {
+        esp_err_t rc = i2c_new_master_bus(user_bus_cfg, &bus);
+        if (rc != ESP_OK || !bus) {
+            ESP_LOGW(TAG, "Failed to create I2C master bus from provided config: 0x%X", rc);
+            return rc != ESP_OK ? rc : ESP_ERR_NOT_FOUND;
+        }
+        created_bus = true;
+        ESP_LOGI(TAG, "Created new I2C master bus from provided config (port=%d SDA=%d SCL=%d)", user_bus_cfg->i2c_port, user_bus_cfg->sda_io_num, user_bus_cfg->scl_io_num);
+    } else {
+        // Auto-detect existing I2C master buses. Prefer I2C_NUM_0 then I2C_NUM_1.
+        attempt = 0;
+        while (attempt < AUTO_SETUP_RETRIES) {
+            if (i2c_master_get_bus_handle(I2C_NUM_0, &bus) == ESP_OK) break;
+            if (i2c_master_get_bus_handle(I2C_NUM_1, &bus) == ESP_OK) break;
+            attempt++;
+            if (attempt >= AUTO_SETUP_RETRIES) break;
+            ESP_LOGI(TAG, "mcp23017: waiting for I2C bus (attempt %d/%d)", attempt+1, AUTO_SETUP_RETRIES);
+            vTaskDelay(pdMS_TO_TICKS(AUTO_SETUP_DELAY_MS));
+        }
+
+        if (!bus) {
+            ESP_LOGW(TAG, "No existing I2C master bus found after %d attempt(s); not creating a default bus", AUTO_SETUP_RETRIES);
+            return ESP_ERR_NOT_FOUND;
+        }
+        // bus found via auto-detect; we do not own it
+        created_bus = false;
+        ESP_LOGI(TAG, "Using existing I2C master bus handle for discovery");
     }
 
     uint8_t addrs[8];
@@ -283,7 +301,7 @@ esp_err_t mcp23017_auto_setup(mcp23017_attached_devices_t *out_devices, bool app
     out_devices->handle = h;
     out_devices->bus = (void*)bus;
     out_devices->addr_count = found;
-    out_devices->owns_bus = false;
+    out_devices->owns_bus = created_bus;
     for (int i = 0; i < found; ++i) out_devices->addresses[i] = addrs[i];
     out_devices->defaults_applied = false;
 

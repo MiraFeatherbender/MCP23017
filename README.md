@@ -28,7 +28,7 @@ void app_main(void)
 {
 	// Discover and attach devices on an existing I2C master bus
 	mcp23017_attached_devices_t devices = {0};
-	esp_err_t rc = mcp23017_auto_setup(&devices, true);
+	esp_err_t rc = mcp23017_auto_setup(&devices, true, NULL);
 	if (rc != ESP_OK || devices.handle == NULL) {
 		// handle error
 		return;

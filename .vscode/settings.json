@@ -15,5 +15,6 @@
     "--background-index",
     "--query-driver=**",
     "--compile-commands-dir=c:\\Users\\jonat\\MCP23017\\build"
-  ]
+  ],
+  "idf.flashType": "UART"
 }

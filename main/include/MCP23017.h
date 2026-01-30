@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include "esp_err.h"
 #include "driver/i2c_types.h"
+#include "driver/i2c_master.h"
 #include "driver/gpio.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -120,7 +121,12 @@ typedef struct {
 // Full-auto setup: autodiscover existing I2C bus, autodiscover devices, attach them,
 // optionally restore register defaults (apply_defaults=true). Returns a filled bundle on success.
 // The only required argument is out_bundle (non-NULL).
-esp_err_t mcp23017_auto_setup(mcp23017_attached_devices_t *out_devices, bool apply_defaults);
+//
+// The function accepts an optional `i2c_master_bus_config_t *user_bus_cfg`.
+// If `user_bus_cfg` is NULL the function uses the built-in defaults when creating
+// a new I2C master bus. If non-NULL, the provided `i2c_master_bus_config_t` will
+// be used to configure the newly-created master bus (it fully overrides defaults).
+esp_err_t mcp23017_auto_setup(mcp23017_attached_devices_t *out_devices, bool apply_defaults, const i2c_master_bus_config_t *user_bus_cfg);
 
 // Low-level reg helpers (operate on handle)
 esp_err_t mcp23017_reg_read8(mcp23017_handle_t h, int dev_idx, uint8_t reg_addr, uint8_t *value);

@@ -82,15 +82,29 @@ static void io_mcp23017_task(void *arg)
 {
     (void)arg;
 
-    // use auto-setup to probe existing I2C bus and attach devices
-    // request that the component apply datasheet defaults to discovered devices
-    // allow retries and delay similar to previous behavior in this plugin
-    esp_err_t rc = mcp23017_auto_setup(&s_mcp_devices, true);
+        // use auto-setup to probe existing I2C bus and attach devices
+        // request that the component apply datasheet defaults to discovered devices
+        // allow retries and delay similar to previous behavior in this plugin
+    
+    i2c_master_bus_config_t bus_cfg = {
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .i2c_port = I2C_NUM_0,
+        .scl_io_num = 9,
+        .sda_io_num = 8,
+        .glitch_ignore_cnt = 7,
+        .intr_priority = 0,
+        .trans_queue_depth = 0,
+    };
+    bus_cfg.flags.enable_internal_pullup = 1;
+    ESP_LOGI(TAG, "Using example I2C bus config: SDA=%d SCL=%d", bus_cfg.sda_io_num, bus_cfg.scl_io_num);
+
+    esp_err_t rc = mcp23017_auto_setup(&s_mcp_devices, true, &bus_cfg);
     if (rc != ESP_OK || s_mcp_devices.handle == NULL) {
         ESP_LOGE(TAG, "Failed to auto-setup MCP23017: 0x%X", rc);
         vTaskDelete(NULL);
         return;
     }
+
     s_mcp_dev = s_mcp_devices.handle;
 
     // The auto_setup applied datasheet defaults; now configure Port B with a batched RMW
