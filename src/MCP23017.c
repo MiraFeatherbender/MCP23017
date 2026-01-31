@@ -25,6 +25,9 @@ struct mcp23017_t {
     bool owns_bus;
     // defaults flag
     bool defaults_applied;
+    // register cache for each attached device (0x00..0x15)
+    uint8_t reg_cache[8][0x16];
+    bool reg_cache_valid[8];
 };
 
 static const uint8_t DEFAULT_REGS[] = {
@@ -53,11 +56,143 @@ static const uint8_t DEFAULT_REGS[] = {
     0x00, // OLATB
 };
 
+// ----------------------- Bus-keyed mutex registry -----------------------
+// Serializes multi-register/block I2C transactions for all handles sharing the same bus.
+#define MCP_BUS_REG_MAX 8
+
+typedef struct {
+    void *bus;
+    SemaphoreHandle_t lock;
+    int refcount;
+} bus_entry_t;
+
+static bus_entry_t s_bus_registry[MCP_BUS_REG_MAX];
+static SemaphoreHandle_t s_bus_registry_lock = NULL;
+
+static esp_err_t bus_registry_add(void *bus)
+{
+    if (!bus) return ESP_ERR_INVALID_ARG;
+    if (!s_bus_registry_lock) {
+        s_bus_registry_lock = xSemaphoreCreateMutex();
+        if (!s_bus_registry_lock) return ESP_ERR_NO_MEM;
+    }
+    if (xSemaphoreTake(s_bus_registry_lock, pdMS_TO_TICKS(200)) != pdTRUE) return ESP_ERR_TIMEOUT;
+    // find existing
+    for (int i = 0; i < MCP_BUS_REG_MAX; ++i) {
+        if (s_bus_registry[i].bus == bus) {
+            s_bus_registry[i].refcount++;
+            xSemaphoreGive(s_bus_registry_lock);
+            return ESP_OK;
+        }
+    }
+    // find empty slot
+    for (int i = 0; i < MCP_BUS_REG_MAX; ++i) {
+        if (s_bus_registry[i].bus == NULL) {
+            s_bus_registry[i].bus = bus;
+            s_bus_registry[i].lock = xSemaphoreCreateMutex();
+            if (!s_bus_registry[i].lock) {
+                s_bus_registry[i].bus = NULL;
+                xSemaphoreGive(s_bus_registry_lock);
+                return ESP_ERR_NO_MEM;
+            }
+            s_bus_registry[i].refcount = 1;
+            xSemaphoreGive(s_bus_registry_lock);
+            return ESP_OK;
+        }
+    }
+    xSemaphoreGive(s_bus_registry_lock);
+    return ESP_ERR_NO_MEM;
+}
+
+static void bus_registry_release(void *bus)
+{
+    if (!bus || !s_bus_registry_lock) return;
+    if (xSemaphoreTake(s_bus_registry_lock, pdMS_TO_TICKS(200)) != pdTRUE) return;
+    for (int i = 0; i < MCP_BUS_REG_MAX; ++i) {
+        if (s_bus_registry[i].bus == bus) {
+            s_bus_registry[i].refcount--;
+            if (s_bus_registry[i].refcount <= 0) {
+                if (s_bus_registry[i].lock) vSemaphoreDelete(s_bus_registry[i].lock);
+                s_bus_registry[i].lock = NULL;
+                s_bus_registry[i].bus = NULL;
+                s_bus_registry[i].refcount = 0;
+            }
+            break;
+        }
+    }
+    xSemaphoreGive(s_bus_registry_lock);
+}
+
+static esp_err_t bus_lock(void *bus, TickType_t tmo)
+{
+    if (!bus) return ESP_ERR_INVALID_ARG;
+    if (!s_bus_registry_lock) return ESP_ERR_INVALID_STATE;
+    if (xSemaphoreTake(s_bus_registry_lock, pdMS_TO_TICKS(200)) != pdTRUE) return ESP_ERR_TIMEOUT;
+    SemaphoreHandle_t m = NULL;
+    for (int i = 0; i < MCP_BUS_REG_MAX; ++i) {
+        if (s_bus_registry[i].bus == bus) { m = s_bus_registry[i].lock; break; }
+    }
+    xSemaphoreGive(s_bus_registry_lock);
+    if (!m) return ESP_ERR_NOT_FOUND;
+    if (xSemaphoreTake(m, tmo) != pdTRUE) return ESP_ERR_TIMEOUT;
+    return ESP_OK;
+}
+
+static void bus_unlock(void *bus)
+{
+    if (!bus || !s_bus_registry_lock) return;
+    if (xSemaphoreTake(s_bus_registry_lock, pdMS_TO_TICKS(200)) != pdTRUE) return;
+    SemaphoreHandle_t m = NULL;
+    for (int i = 0; i < MCP_BUS_REG_MAX; ++i) {
+        if (s_bus_registry[i].bus == bus) { m = s_bus_registry[i].lock; break; }
+    }
+    xSemaphoreGive(s_bus_registry_lock);
+    if (m) xSemaphoreGive(m);
+}
+
 // Internal low-level helpers using i2c_master APIs
 static esp_err_t read8_device(void *dev, uint8_t reg, uint8_t *out)
 {
     if (!dev || !out) return ESP_ERR_INVALID_ARG;
     return i2c_master_transmit_receive((i2c_master_dev_handle_t)dev, &reg, 1, out, 1, pdMS_TO_TICKS(200));
+}
+
+// Block read: send start reg then read `len` bytes into buf in a single I2C transaction
+static esp_err_t readn_device(void *dev, uint8_t start_reg, uint8_t *buf, size_t len, TickType_t tmo)
+{
+    if (!dev || !buf || len == 0) return ESP_ERR_INVALID_ARG;
+    return i2c_master_transmit_receive((i2c_master_dev_handle_t)dev, &start_reg, 1, buf, len, tmo);
+}
+
+// Populate the register cache for a specific device index. Reads 0x00..0x15
+// in a single block under the bus mutex and marks the cache valid on success.
+static esp_err_t populate_register_cache(mcp23017_handle_t h, int dev_idx)
+{
+    if (!h || dev_idx < 0 || dev_idx >= h->addr_count) return ESP_ERR_INVALID_ARG;
+    i2c_master_dev_handle_t dev = (i2c_master_dev_handle_t)h->dev_handles[dev_idx];
+    if (!dev) return ESP_ERR_INVALID_ARG;
+    const uint8_t start_reg = 0x00;
+    const size_t n = 0x16;
+    esp_err_t r = bus_lock(h->bus, pdMS_TO_TICKS(500));
+    if (r != ESP_OK) return r;
+    r = readn_device(dev, start_reg, h->reg_cache[dev_idx], n, pdMS_TO_TICKS(500));
+    if (r == ESP_OK) h->reg_cache_valid[dev_idx] = true;
+    bus_unlock(h->bus);
+    return r;
+}
+
+// Public: re-populate the register cache for a device index
+esp_err_t mcp23017_sync_registers(mcp23017_handle_t h, int dev_idx)
+{
+    return populate_register_cache(h, dev_idx);
+}
+
+// Public: invalidate the register cache for a device index
+esp_err_t mcp23017_invalidate_register_cache(mcp23017_handle_t h, int dev_idx)
+{
+    if (!h || dev_idx < 0 || dev_idx >= h->addr_count) return ESP_ERR_INVALID_ARG;
+    h->reg_cache_valid[dev_idx] = false;
+    return ESP_OK;
 }
 
 static esp_err_t write8_device(void *dev, uint8_t reg, uint8_t val)
@@ -80,19 +215,59 @@ static mcp23017_handle_t handle_create_from_devices(void *bus, uint8_t *addrs, i
         h->dev_handles[i] = devs[i];
     }
     h->defaults_applied = false;
+    // register bus for mutexing multi-register operations
+    (void)bus_registry_add(h->bus);
     return h;
 }
 
 esp_err_t mcp23017_reg_read8(mcp23017_handle_t h, int dev_idx, uint8_t reg_addr, uint8_t *value)
 {
     if (!h || dev_idx < 0 || dev_idx >= h->addr_count) return ESP_ERR_INVALID_ARG;
-    return read8_device(h->dev_handles[dev_idx], reg_addr, value);
+    // Use register cache for configuration registers (0x00..0x0D) when valid.
+    if (reg_addr < MCP_REG_INTFA && h->reg_cache_valid[dev_idx]) {
+        *value = h->reg_cache[dev_idx][reg_addr];
+        return ESP_OK;
+    }
+    // Otherwise perform a live read under the bus lock
+    esp_err_t r = bus_lock(h->bus, pdMS_TO_TICKS(300));
+    if (r != ESP_OK) return r;
+    r = read8_device(h->dev_handles[dev_idx], reg_addr, value);
+    bus_unlock(h->bus);
+    return r;
+}
+
+// Block read wrapper exposed in header
+esp_err_t mcp23017_reg_read_block(mcp23017_handle_t h, int dev_idx, uint8_t reg_addr, uint8_t *buf, size_t len)
+{
+    if (!h || dev_idx < 0 || dev_idx >= h->addr_count) return ESP_ERR_INVALID_ARG;
+    // If the requested block is fully within the cached range and cache is valid,
+    // copy from cache to avoid I2C transfer.
+    const size_t CACHE_N = 0x16;
+    if (reg_addr < MCP_REG_INTFA && (size_t)reg_addr + len <= CACHE_N && h->reg_cache_valid[dev_idx]) {
+        memcpy(buf, &h->reg_cache[dev_idx][reg_addr], len);
+        return ESP_OK;
+    }
+    esp_err_t r = bus_lock(h->bus, pdMS_TO_TICKS(500));
+    if (r != ESP_OK) return r;
+    r = readn_device(h->dev_handles[dev_idx], reg_addr, buf, len, pdMS_TO_TICKS(300));
+    bus_unlock(h->bus);
+    return r;
 }
 
 esp_err_t mcp23017_reg_write8(mcp23017_handle_t h, int dev_idx, uint8_t reg_addr, uint8_t value)
 {
     if (!h || dev_idx < 0 || dev_idx >= h->addr_count) return ESP_ERR_INVALID_ARG;
-    return write8_device(h->dev_handles[dev_idx], reg_addr, value);
+    esp_err_t r = bus_lock(h->bus, pdMS_TO_TICKS(300));
+    if (r != ESP_OK) return r;
+    r = write8_device(h->dev_handles[dev_idx], reg_addr, value);
+    if (r == ESP_OK) {
+        if (reg_addr < MCP_REG_INTFA) {
+            h->reg_cache[dev_idx][reg_addr] = value;
+            h->reg_cache_valid[dev_idx] = true;
+        }
+    }
+    bus_unlock(h->bus);
+    return r;
 }
 
 // Helper to attach a device at address 'a' to bus and return dev handle (or NULL)
@@ -134,8 +309,13 @@ static esp_err_t discover_devices_on_bus(void *bus, uint8_t *out_addrs, i2c_mast
 }
 
 // Apply datasheet defaults quickly by writing sequential block starting at 0x00 (IODIRA)
-static esp_err_t apply_defaults_to_device(i2c_master_dev_handle_t dev)
+// Apply defaults to device using the device handle index from our mcp handle so
+// we can serialize with the bus mutex. This writes the DEFAULT_REGS sequential
+// in a single I2C transaction under the bus lock.
+static esp_err_t apply_defaults_to_device(mcp23017_handle_t h, int dev_idx)
 {
+    if (!h || dev_idx < 0 || dev_idx >= h->addr_count) return ESP_ERR_INVALID_ARG;
+    i2c_master_dev_handle_t dev = (i2c_master_dev_handle_t)h->dev_handles[dev_idx];
     if (!dev) return ESP_ERR_INVALID_ARG;
     const uint8_t start_reg = 0x00;
     const size_t n = sizeof(DEFAULT_REGS);
@@ -143,7 +323,10 @@ static esp_err_t apply_defaults_to_device(i2c_master_dev_handle_t dev)
     if (!buf) return ESP_ERR_NO_MEM;
     buf[0] = start_reg;
     memcpy(buf + 1, DEFAULT_REGS, n);
-    esp_err_t rc = i2c_master_transmit(dev, buf, n + 1, pdMS_TO_TICKS(500));
+    esp_err_t rc = bus_lock(h->bus, pdMS_TO_TICKS(500));
+    if (rc != ESP_OK) { free(buf); return rc; }
+    rc = i2c_master_transmit(dev, buf, n + 1, pdMS_TO_TICKS(500));
+    bus_unlock(h->bus);
     free(buf);
     return rc;
 }
@@ -155,6 +338,8 @@ esp_err_t mcp23017_delete(mcp23017_handle_t h)
     for (int i = 0; i < h->addr_count; ++i) {
         if (h->dev_handles[i]) i2c_master_bus_rm_device((i2c_master_dev_handle_t)h->dev_handles[i]);
     }
+    // release bus registry entry created at handle creation
+    if (h->bus) bus_registry_release(h->bus);
     if (h->owns_bus && h->bus) i2c_del_master_bus((i2c_master_bus_handle_t)h->bus);
     free(h);
     return ESP_OK;
@@ -308,13 +493,23 @@ esp_err_t mcp23017_auto_setup(mcp23017_attached_devices_t *out_devices, bool app
     if (apply_defaults) {
         bool all_ok = true;
         for (int i = 0; i < found; ++i) {
-            esp_err_t rc = apply_defaults_to_device(devs[i]);
+            esp_err_t rc = apply_defaults_to_device(h, i);
             if (rc != ESP_OK) {
                 ESP_LOGW(TAG, "Failed to apply defaults to device 0x%02X: %d", addrs[i], rc);
                 all_ok = false;
             }
         }
         out_devices->defaults_applied = all_ok;
+    }
+
+    // Populate register cache for each attached device so subsequent RMWs
+    // can use the local mirror instead of extra I2C transactions.
+    for (int i = 0; i < found; ++i) {
+        esp_err_t rc = populate_register_cache(h, i);
+        if (rc != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to populate register cache for device 0x%02X: 0x%X", addrs[i], rc);
+            // continue - cache will be invalid and driver will fall back to live reads
+        }
     }
 
     ESP_LOGI(TAG, "discovered %d MCP23017 device(s)", found);
@@ -399,6 +594,18 @@ esp_err_t mcp23017_set_int_polarity(mcp23017_handle_t h, int dev_idx, mcp23017_i
     return mcp23017_reg_write8(h, dev_idx, MCP_REG_IOCON, iocon);
 }
 
+// Enable/disable IOCON.MIRROR bit to mirror interrupts between ports
+esp_err_t mcp23017_set_int_mirror(mcp23017_handle_t h, int dev_idx, bool enable)
+{
+    if (!h || dev_idx < 0 || dev_idx >= h->addr_count) return ESP_ERR_INVALID_ARG;
+    uint8_t iocon = 0;
+    esp_err_t r = mcp23017_reg_read8(h, dev_idx, MCP_REG_IOCON, &iocon);
+    if (r != ESP_OK) return r;
+    const uint8_t MIRROR_BIT = 0x40; // IOCON.MIRROR (per datasheet)
+    if (enable) iocon |= MIRROR_BIT; else iocon &= (uint8_t)(~MIRROR_BIT);
+    return mcp23017_reg_write8(h, dev_idx, MCP_REG_IOCON, iocon);
+}
+
 // Configure a port (mask) with combined settings: direction, pull-up, interrupt mode/polarity, and initial level for outputs.
 // If cfg->flags has MCP_CFG_BATCH_WRITE set, attempt a sequential read of registers 0x00..0x15, modify relevant bytes,
 // and write them back in a single sequential write. Falls back to individual register RMW calls.
@@ -415,14 +622,19 @@ esp_err_t mcp23017_config_port(mcp23017_handle_t h, int dev_idx, const mcp23017_
     uint8_t intcon_reg= (cfg->port==MCP_PORT_A)?MCP_REG_INTCONA:MCP_REG_INTCONB;
     uint8_t defval_reg= (cfg->port==MCP_PORT_A)?MCP_REG_DEFVALA:MCP_REG_DEFVALB;
 
-    // If batching requested, attempt block read-modify-write
+    // If batching requested, attempt to perform a block write using the
+    // local register cache when available to avoid extra I2C RMWs.
     if (cfg->flags & MCP_CFG_BATCH_WRITE) {
         const uint8_t start_reg = 0x00;
         const size_t n = 0x16; // 0x00..0x15 inclusive
-        uint8_t *buf = malloc(n);
-        if (!buf) return ESP_ERR_NO_MEM;
-        esp_err_t r = i2c_master_transmit_receive(dev, &start_reg, 1, buf, n, pdMS_TO_TICKS(300));
-        if (r == ESP_OK) {
+
+        // If cache valid, modify it in-memory and write sequentially under bus lock.
+        if (h->reg_cache_valid[dev_idx]) {
+            uint8_t *buf = malloc(n);
+            if (!buf) return ESP_ERR_NO_MEM;
+            // copy current cache
+            memcpy(buf, h->reg_cache[dev_idx], n);
+
             // Modify IODIR
             uint8_t cur_iodir = buf[iodir_reg];
             if (cfg->pin_mode == MCP_PIN_INPUT) cur_iodir |= cfg->mask; else cur_iodir &= (uint8_t)(~cfg->mask);
@@ -461,12 +673,24 @@ esp_err_t mcp23017_config_port(mcp23017_handle_t h, int dev_idx, const mcp23017_
                 buf[gpinten_reg] |= cfg->mask;
             }
 
-            // Write back sequentially: prepend start reg
+            // Write back sequentially under bus lock
             uint8_t *w = malloc(n + 1);
             if (!w) { free(buf); return ESP_ERR_NO_MEM; }
             w[0] = start_reg;
             memcpy(w + 1, buf, n);
-            r = i2c_master_transmit(dev, w, n + 1, pdMS_TO_TICKS(500));
+
+            esp_err_t r = bus_lock(h->bus, pdMS_TO_TICKS(500));
+            if (r == ESP_OK) {
+                r = i2c_master_transmit(dev, w, n + 1, pdMS_TO_TICKS(500));
+                if (r == ESP_OK) {
+                    // commit cache changes
+                    memcpy(h->reg_cache[dev_idx], buf, n);
+                    h->reg_cache_valid[dev_idx] = true;
+                }
+                bus_unlock(h->bus);
+            } else {
+                r = ESP_ERR_TIMEOUT;
+            }
             free(w);
             free(buf);
             if (r == ESP_OK) {
@@ -478,8 +702,66 @@ esp_err_t mcp23017_config_port(mcp23017_handle_t h, int dev_idx, const mcp23017_
             }
             // fall through to per-register path on failure
         } else {
-            free(buf);
-            // fall through to per-register path
+            // Cache not valid: fall back to reading device and performing sequential RMW
+            const uint8_t start_reg = 0x00;
+            const size_t n = 0x16; // 0x00..0x15 inclusive
+            uint8_t *buf = malloc(n);
+            if (!buf) return ESP_ERR_NO_MEM;
+            esp_err_t r = i2c_master_transmit_receive(dev, &start_reg, 1, buf, n, pdMS_TO_TICKS(300));
+            if (r == ESP_OK) {
+                // Modify and write back as before
+                uint8_t cur_iodir = buf[iodir_reg];
+                if (cfg->pin_mode == MCP_PIN_INPUT) cur_iodir |= cfg->mask; else cur_iodir &= (uint8_t)(~cfg->mask);
+                buf[iodir_reg] = cur_iodir;
+                uint8_t cur_gppu = buf[gppu_reg];
+                if (cfg->pullup == MCP_PULLUP_ENABLE) cur_gppu |= cfg->mask; else cur_gppu &= (uint8_t)(~cfg->mask);
+                buf[gppu_reg] = cur_gppu;
+                uint8_t cur_olat = buf[olat_reg];
+                cur_olat = (cur_olat & (uint8_t)(~cfg->mask)) | (cfg->initial_level & cfg->mask);
+                buf[olat_reg] = cur_olat;
+                if (cfg->int_mode != MCP_INT_NONE) {
+                    uint8_t cur_intcon = buf[intcon_reg];
+                    uint8_t cur_defval = buf[defval_reg];
+                    switch (cfg->int_mode) {
+                        case MCP_INT_ANYEDGE:
+                            cur_intcon &= (uint8_t)(~cfg->mask);
+                            break;
+                        case MCP_INT_POSEDGE:
+                            cur_intcon |= cfg->mask;
+                            cur_defval &= (uint8_t)(~cfg->mask);
+                            break;
+                        case MCP_INT_NEGEDGE:
+                            cur_intcon |= cfg->mask;
+                            cur_defval |= cfg->mask;
+                            break;
+                        default:
+                            break;
+                    }
+                    buf[intcon_reg] = cur_intcon;
+                    buf[defval_reg] = cur_defval;
+                    uint8_t gpinten_reg = (cfg->port==MCP_PORT_A)?MCP_REG_GPINTENA:MCP_REG_GPINTENB;
+                    buf[gpinten_reg] |= cfg->mask;
+                }
+                uint8_t *w = malloc(n + 1);
+                if (!w) { free(buf); return ESP_ERR_NO_MEM; }
+                w[0] = start_reg;
+                memcpy(w + 1, buf, n);
+                r = i2c_master_transmit(dev, w, n + 1, pdMS_TO_TICKS(500));
+                free(w);
+                if (r == ESP_OK) {
+                    // update cache if possible
+                    if (h->reg_cache_valid[dev_idx]) memcpy(h->reg_cache[dev_idx], buf, n);
+                    free(buf);
+                    if (cfg->int_polarity != MCP_INT_POL_NONE) {
+                        return mcp23017_set_int_polarity(h, dev_idx, cfg->int_polarity);
+                    }
+                    return ESP_OK;
+                }
+                free(buf);
+            } else {
+                free(buf);
+            }
+            // fall through to per-register path on failure
         }
     }
 

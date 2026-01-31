@@ -131,6 +131,9 @@ esp_err_t mcp23017_auto_setup(mcp23017_attached_devices_t *out_devices, bool app
 // Low-level reg helpers (operate on handle)
 esp_err_t mcp23017_reg_read8(mcp23017_handle_t h, int dev_idx, uint8_t reg_addr, uint8_t *value);
 esp_err_t mcp23017_reg_write8(mcp23017_handle_t h, int dev_idx, uint8_t reg_addr, uint8_t value);
+// Block read starting at reg_addr (sequential addressing). Performs a single
+// I2C transaction reading `len` bytes into `buf`.
+esp_err_t mcp23017_reg_read_block(mcp23017_handle_t h, int dev_idx, uint8_t reg_addr, uint8_t *buf, size_t len);
 
 // Lifecycle
 esp_err_t mcp23017_delete(mcp23017_handle_t h);
@@ -143,6 +146,19 @@ esp_err_t mcp23017_set_interrupt_mode(mcp23017_handle_t h, int dev_idx, mcp23017
 // IOCON ODR bit and leave INTPOL cleared (open-drain active-low). ACTIVE_HIGH/A_ACTIVE_LOW
 // will clear/set INTPOL and clear ODR accordingly.
 esp_err_t mcp23017_set_int_polarity(mcp23017_handle_t h, int dev_idx, mcp23017_int_polarity_t polarity);
+
+// Enable or disable INT mirror mode: when enabled the device ORs both
+// port interrupt outputs onto the single INT pin(s) per datasheet IOCON.MIRROR bit.
+// `enable` true sets the MIRROR bit, false clears it.
+esp_err_t mcp23017_set_int_mirror(mcp23017_handle_t h, int dev_idx, bool enable);
+
+// Explicitly re-populate the register cache for the given device index (reads 0x00..0x15).
+// Use when external code may have modified device registers and the cache needs refresh.
+esp_err_t mcp23017_sync_registers(mcp23017_handle_t h, int dev_idx);
+
+// Invalidate the register cache for the given device index so subsequent calls
+// will perform live reads until `mcp23017_sync_registers()` is called.
+esp_err_t mcp23017_invalidate_register_cache(mcp23017_handle_t h, int dev_idx);
 
 // Configure a port (mask) with combined settings: direction, pull-up, interrupt mode/polarity, and initial level for outputs.
 // If cfg->flags has MCP_CFG_BATCH_WRITE set, attempt a sequential read of registers 0x00..0x15, modify relevant bytes,
