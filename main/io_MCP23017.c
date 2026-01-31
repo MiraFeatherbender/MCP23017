@@ -94,9 +94,7 @@ static void io_mcp23017_task(void *arg)
         .glitch_ignore_cnt = 7,
         .intr_priority = 0,
         .trans_queue_depth = 0,
-        .flags{
-            enable_internal_pullup = 1,
-        },
+        .flags.enable_internal_pullup = 1,
     };
     ESP_LOGI(TAG, "Using example I2C bus config: SDA=%d SCL=%d", bus_cfg.sda_io_num, bus_cfg.scl_io_num);
 
