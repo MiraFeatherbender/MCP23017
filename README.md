@@ -1,6 +1,10 @@
-# MCP23017 Component
+# MCP23017 ESP-IDF component
 
-This scaffold contains the MCP23017 component sources and an example plugin app.
+This component provides a minimal driver for the Microchip MCP23017 I2C GPIO expander.
+
+Public headers are in `include/` and the implementation in `src/`.
+
+Usage: add this component to your project under `components/` or reference it via `EXTRA_COMPONENT_DIRS`.
 
 Layout:
 - `components/mcp23017/include/MCP23017.h` - public header
