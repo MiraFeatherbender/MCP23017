@@ -100,6 +100,12 @@ esp_err_t mcp23017_port_write(void *handle, int dev_idx, mcp23017_port_t port, u
 esp_err_t mcp23017_port_masked_write(void *handle, int dev_idx, mcp23017_port_t port, uint8_t mask, uint8_t value);
 esp_err_t mcp23017_port_set_dir(void *handle, int dev_idx, mcp23017_port_t port, uint8_t dir_mask);
 esp_err_t mcp23017_port_set_pullup(void *handle, int dev_idx, mcp23017_port_t port, uint8_t mask, mcp23017_pull_t pull);
+// Read a port and return the bit-reversed byte (LSB/MSB flipped)
+esp_err_t mcp23017_port_read_reversed(void *handle, int dev_idx, mcp23017_port_t port, uint8_t *out_rev);
+
+// Reverse bits of an 8-bit value in-place via pointer (LSB<->MSB).
+// Useful for callers that already have a byte and want the bit-reversed value.
+void mcp23017_reverse8_inplace(uint8_t *value);
 
 // 16-bit helpers that simply wrap two 8-bit operations (PORTA as high byte, PORTB as low byte)
 esp_err_t mcp23017_read_gpio16(void *handle, int dev_idx, uint16_t *value);

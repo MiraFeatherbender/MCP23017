@@ -405,6 +405,45 @@ esp_err_t mcp23017_read_gpio16(void *handle, int dev_idx, uint16_t *value)
     return ESP_OK;
 }
 
+// Inline bit-reverse helper (compact, used to initialize lookup table)
+static inline uint8_t rev8_inline(uint8_t x)
+{
+    x = (x >> 4) | (x << 4);
+    x = (uint8_t)(((x & 0xCC) >> 2) | ((x & 0x33) << 2));
+    x = (uint8_t)(((x & 0xAA) >> 1) | ((x & 0x55) << 1));
+    return x;
+}
+
+// Lazily-initialized 256-entry reverse lookup table
+static uint8_t rev8_table[256];
+static bool rev8_table_inited = false;
+static void rev8_table_init(void)
+{
+    if (rev8_table_inited) return;
+    for (int i = 0; i < 256; ++i) rev8_table[i] = rev8_inline((uint8_t)i);
+    rev8_table_inited = true;
+}
+
+// Read a port and return the reversed-bit value via out_rev
+esp_err_t mcp23017_port_read_reversed(void *handle, int dev_idx, mcp23017_port_t port, uint8_t *out_rev)
+{
+    if (!handle || !out_rev) return ESP_ERR_INVALID_ARG;
+    uint8_t v = 0;
+    esp_err_t r = mcp23017_port_read(handle, dev_idx, port, &v);
+    if (r != ESP_OK) return r;
+    rev8_table_init();
+    *out_rev = rev8_table[v];
+    return ESP_OK;
+}
+
+// Reverse bits of an 8-bit value in-place. Caller must pass non-NULL pointer.
+void mcp23017_reverse8_inplace(uint8_t *value)
+{
+    if (!value) return;
+    rev8_table_init();
+    *value = rev8_table[*value];
+}
+
 esp_err_t mcp23017_write_gpio16(void *handle, int dev_idx, uint16_t value)
 {
     if (!handle) return ESP_ERR_INVALID_ARG;
