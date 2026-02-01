@@ -420,7 +420,7 @@ esp_err_t mcp23017_auto_setup(mcp23017_attached_devices_t *out_devices, bool app
     if (!out_devices) return ESP_ERR_INVALID_ARG;
     memset(out_devices, 0, sizeof(*out_devices));
 
-    const int AUTO_SETUP_RETRIES = 10;
+    const int AUTO_SETUP_RETRIES = 50;
     const int AUTO_SETUP_DELAY_MS = 200;
 
     i2c_master_bus_handle_t bus = NULL;
