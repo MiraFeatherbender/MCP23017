@@ -11,6 +11,57 @@
 
 static const char *TAG = "mcp23017";
 
+#define MCP_TMO_REG_READ_BLOCK_LOCK_MS 800
+#define MCP_TMO_REG_READ_BLOCK_XFER_MS 800
+
+typedef enum {
+    MCP_TO_BUS_REGISTRY_ADD_LOCK = 0,
+    MCP_TO_BUS_LOCK_REGISTRY,
+    MCP_TO_BUS_LOCK_MUTEX,
+    MCP_TO_READ8_DEVICE,
+    MCP_TO_READN_DEVICE,
+    MCP_TO_WRITE8_DEVICE,
+    MCP_TO_REG_READ_BLOCK_LOCK,
+    MCP_TO_REG_READ_BLOCK_XFER,
+    MCP_TO_REG_READ_BLOCK_RETRY_XFER,
+    MCP_TO_MAX
+} mcp_timeout_site_t;
+
+static uint32_t s_timeout_counts[MCP_TO_MAX] = {0};
+static uint32_t s_block_read_recovery_attempts = 0;
+static uint32_t s_block_read_recovery_success = 0;
+
+static const char *timeout_site_name(mcp_timeout_site_t site)
+{
+    switch (site) {
+        case MCP_TO_BUS_REGISTRY_ADD_LOCK: return "bus_registry_add.lock";
+        case MCP_TO_BUS_LOCK_REGISTRY: return "bus_lock.registry";
+        case MCP_TO_BUS_LOCK_MUTEX: return "bus_lock.mutex";
+        case MCP_TO_READ8_DEVICE: return "read8_device";
+        case MCP_TO_READN_DEVICE: return "readn_device";
+        case MCP_TO_WRITE8_DEVICE: return "write8_device";
+        case MCP_TO_REG_READ_BLOCK_LOCK: return "reg_read_block.lock";
+        case MCP_TO_REG_READ_BLOCK_XFER: return "reg_read_block.xfer";
+        case MCP_TO_REG_READ_BLOCK_RETRY_XFER: return "reg_read_block.retry_xfer";
+        default: return "unknown";
+    }
+}
+
+static void timeout_trace(mcp_timeout_site_t site, const char *op, int dev_idx, uint8_t reg_addr, size_t len, TickType_t tmo_ticks)
+{
+    if (site < MCP_TO_MAX) s_timeout_counts[site]++;
+    const uint32_t count = (site < MCP_TO_MAX) ? s_timeout_counts[site] : 0;
+    ESP_LOGW(TAG,
+             "timeout[%s] cnt=%lu op=%s dev=%d reg=0x%02X len=%u tmo=%lu ms",
+             timeout_site_name(site),
+             (unsigned long)count,
+             op ? op : "-",
+             dev_idx,
+             reg_addr,
+             (unsigned)len,
+             (unsigned long)(tmo_ticks * portTICK_PERIOD_MS));
+}
+
 const char *mcp23017_version(void)
 {
     return "mcp23017 alpha";
@@ -76,7 +127,10 @@ static esp_err_t bus_registry_add(void *bus)
         s_bus_registry_lock = xSemaphoreCreateMutex();
         if (!s_bus_registry_lock) return ESP_ERR_NO_MEM;
     }
-    if (xSemaphoreTake(s_bus_registry_lock, pdMS_TO_TICKS(200)) != pdTRUE) return ESP_ERR_TIMEOUT;
+    if (xSemaphoreTake(s_bus_registry_lock, pdMS_TO_TICKS(200)) != pdTRUE) {
+        timeout_trace(MCP_TO_BUS_REGISTRY_ADD_LOCK, "bus_registry_add", -1, 0, 0, pdMS_TO_TICKS(200));
+        return ESP_ERR_TIMEOUT;
+    }
     // find existing
     for (int i = 0; i < MCP_BUS_REG_MAX; ++i) {
         if (s_bus_registry[i].bus == bus) {
@@ -127,14 +181,20 @@ static esp_err_t bus_lock(void *bus, TickType_t tmo)
 {
     if (!bus) return ESP_ERR_INVALID_ARG;
     if (!s_bus_registry_lock) return ESP_ERR_INVALID_STATE;
-    if (xSemaphoreTake(s_bus_registry_lock, pdMS_TO_TICKS(200)) != pdTRUE) return ESP_ERR_TIMEOUT;
+    if (xSemaphoreTake(s_bus_registry_lock, pdMS_TO_TICKS(400)) != pdTRUE) {
+        timeout_trace(MCP_TO_BUS_LOCK_REGISTRY, "bus_lock.registry", -1, 0, 0, pdMS_TO_TICKS(400));
+        return ESP_ERR_TIMEOUT;
+    }
     SemaphoreHandle_t m = NULL;
     for (int i = 0; i < MCP_BUS_REG_MAX; ++i) {
         if (s_bus_registry[i].bus == bus) { m = s_bus_registry[i].lock; break; }
     }
     xSemaphoreGive(s_bus_registry_lock);
     if (!m) return ESP_ERR_NOT_FOUND;
-    if (xSemaphoreTake(m, tmo) != pdTRUE) return ESP_ERR_TIMEOUT;
+    if (xSemaphoreTake(m, tmo) != pdTRUE) {
+        timeout_trace(MCP_TO_BUS_LOCK_MUTEX, "bus_lock.mutex", -1, 0, 0, tmo);
+        return ESP_ERR_TIMEOUT;
+    }
     return ESP_OK;
 }
 
@@ -154,14 +214,22 @@ static void bus_unlock(void *bus)
 static esp_err_t read8_device(void *dev, uint8_t reg, uint8_t *out)
 {
     if (!dev || !out) return ESP_ERR_INVALID_ARG;
-    return i2c_master_transmit_receive((i2c_master_dev_handle_t)dev, &reg, 1, out, 1, pdMS_TO_TICKS(200));
+    esp_err_t r = i2c_master_transmit_receive((i2c_master_dev_handle_t)dev, &reg, 1, out, 1, pdMS_TO_TICKS(200));
+    if (r == ESP_ERR_TIMEOUT) {
+        timeout_trace(MCP_TO_READ8_DEVICE, "read8", -1, reg, 1, pdMS_TO_TICKS(200));
+    }
+    return r;
 }
 
 // Block read: send start reg then read `len` bytes into buf in a single I2C transaction
 static esp_err_t readn_device(void *dev, uint8_t start_reg, uint8_t *buf, size_t len, TickType_t tmo)
 {
     if (!dev || !buf || len == 0) return ESP_ERR_INVALID_ARG;
-    return i2c_master_transmit_receive((i2c_master_dev_handle_t)dev, &start_reg, 1, buf, len, tmo);
+    esp_err_t r = i2c_master_transmit_receive((i2c_master_dev_handle_t)dev, &start_reg, 1, buf, len, tmo);
+    if (r == ESP_ERR_TIMEOUT) {
+        timeout_trace(MCP_TO_READN_DEVICE, "readn", -1, start_reg, len, tmo);
+    }
+    return r;
 }
 
 // Populate the register cache for a specific device index. Reads 0x00..0x15
@@ -199,7 +267,46 @@ static esp_err_t write8_device(void *dev, uint8_t reg, uint8_t val)
 {
     if (!dev) return ESP_ERR_INVALID_ARG;
     uint8_t buf[2] = { reg, val };
-    return i2c_master_transmit((i2c_master_dev_handle_t)dev, buf, 2, pdMS_TO_TICKS(200));
+    esp_err_t r = i2c_master_transmit((i2c_master_dev_handle_t)dev, buf, 2, pdMS_TO_TICKS(200));
+    if (r == ESP_ERR_TIMEOUT) {
+        timeout_trace(MCP_TO_WRITE8_DEVICE, "write8", -1, reg, 2, pdMS_TO_TICKS(200));
+    }
+    return r;
+}
+
+// MCP23017 INT output can remain asserted until interrupt condition is cleared.
+// A timeout during INTFA..INTCAPB block reads can leave diagnostics stale under bursty edges.
+// Recovery strategy: perform explicit GPIOA/GPIOB reads to clear/advance latch state, then retry once.
+static esp_err_t recover_interrupt_read_timeout(mcp23017_handle_t h, int dev_idx)
+{
+    if (!h || dev_idx < 0 || dev_idx >= h->addr_count) return ESP_ERR_INVALID_ARG;
+
+    i2c_master_dev_handle_t dev = (i2c_master_dev_handle_t)h->dev_handles[dev_idx];
+    if (!dev) return ESP_ERR_INVALID_ARG;
+
+    uint8_t gpio_a = 0;
+    uint8_t gpio_b = 0;
+    esp_err_t ra = read8_device(dev, MCP_REG_GPIOA, &gpio_a);
+    esp_err_t rb = read8_device(dev, MCP_REG_GPIOB, &gpio_b);
+
+    if (ra == ESP_OK && rb == ESP_OK) {
+        s_block_read_recovery_success++;
+        ESP_LOGW(TAG,
+                 "recovery: GPIOA/GPIOB manual reads ok (A=0x%02X B=0x%02X), success=%lu/%lu",
+                 gpio_a,
+                 gpio_b,
+                 (unsigned long)s_block_read_recovery_success,
+                 (unsigned long)s_block_read_recovery_attempts);
+        return ESP_OK;
+    }
+
+    ESP_LOGW(TAG,
+             "recovery: GPIOA/GPIOB manual reads failed (A rc=0x%X, B rc=0x%X), success=%lu/%lu",
+             ra,
+             rb,
+             (unsigned long)s_block_read_recovery_success,
+             (unsigned long)s_block_read_recovery_attempts);
+    return (ra != ESP_OK) ? ra : rb;
 }
 
 // Create a handle from an existing bus and a list of addresses (already attached)
@@ -247,10 +354,43 @@ esp_err_t mcp23017_reg_read_block(mcp23017_handle_t h, int dev_idx, uint8_t reg_
         memcpy(buf, &h->reg_cache[dev_idx][reg_addr], len);
         return ESP_OK;
     }
-    esp_err_t r = bus_lock(h->bus, pdMS_TO_TICKS(500));
-    if (r != ESP_OK) return r;
-    r = readn_device(h->dev_handles[dev_idx], reg_addr, buf, len, pdMS_TO_TICKS(300));
+    const TickType_t lock_tmo = pdMS_TO_TICKS(MCP_TMO_REG_READ_BLOCK_LOCK_MS);
+    const TickType_t xfer_tmo = pdMS_TO_TICKS(MCP_TMO_REG_READ_BLOCK_XFER_MS);
+    esp_err_t r = bus_lock(h->bus, lock_tmo);
+    if (r != ESP_OK) {
+        if (r == ESP_ERR_TIMEOUT) {
+            timeout_trace(MCP_TO_REG_READ_BLOCK_LOCK, "reg_read_block", dev_idx, reg_addr, len, lock_tmo);
+        }
+        return r;
+    }
+
+    r = readn_device(h->dev_handles[dev_idx], reg_addr, buf, len, xfer_tmo);
+    if (r == ESP_ERR_TIMEOUT) {
+        timeout_trace(MCP_TO_REG_READ_BLOCK_XFER, "reg_read_block", dev_idx, reg_addr, len, xfer_tmo);
+
+        const bool is_int_diag_window = (reg_addr == MCP_REG_INTFA) && (len >= 4);
+        if (is_int_diag_window) {
+            s_block_read_recovery_attempts++;
+            ESP_LOGW(TAG,
+                     "reg_read_block timeout on INTFA..INTCAPB window, attempting recovery (%lu)",
+                     (unsigned long)s_block_read_recovery_attempts);
+            (void)recover_interrupt_read_timeout(h, dev_idx);
+
+            esp_err_t retry = readn_device(h->dev_handles[dev_idx], reg_addr, buf, len, xfer_tmo);
+            if (retry == ESP_ERR_TIMEOUT) {
+                timeout_trace(MCP_TO_REG_READ_BLOCK_RETRY_XFER, "reg_read_block_retry", dev_idx, reg_addr, len, xfer_tmo);
+            } else if (retry == ESP_OK) {
+                ESP_LOGW(TAG, "reg_read_block recovery retry succeeded for INTFA..INTCAPB");
+            }
+            r = retry;
+        }
+    }
+
     bus_unlock(h->bus);
+    if (r == ESP_ERR_TIMEOUT) {
+        // avoid stale config cache assumptions after bus/device timeout events
+        h->reg_cache_valid[dev_idx] = false;
+    }
     return r;
 }
 
